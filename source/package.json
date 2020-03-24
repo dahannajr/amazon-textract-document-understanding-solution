@@ -15,10 +15,10 @@
   ],
   "stack": {
     "stackname": "DUS",
-    "region": "%%REGION%%"
+    "region": "us-east-1"
   },
   "cicd": "false",
-  "email": "%%USER_EMAIL%%",
+  "email": "david.hanna@kickstepinc.com",
   "scripts": {
     "bootstrap": "AWS_REGION=$npm_package_stack_region USER_EMAIL=$npm_package_email cdk bootstrap --toolkit-stack-name DocumentUnderstandingCDKToolkit",
     "compile-ts-stacks": "yarn compile-ts-backend-stack && yarn compile-ts-client-stack",
@@ -33,8 +33,8 @@
     "deploy": "yarn deploy-all && yarn update-pdf-lambda-code",
     "deploy:frontend": "yarn deploy:client && yarn deploy:setup-samples && yarn deploy:show",
     "destroy": "STACKNAME=$npm_package_stack_stackname AWS_REGION=$npm_package_stack_region cdk destroy -v true -a \"node bin/deploy-client-stack.js\" && STACKNAME=$npm_package_stack_stackname AWS_REGION=$npm_package_stack_region USER_EMAIL=$npm_package_email cdk destroy -v true",
-    "update-client-stack-variables": "bash ../deployment/custom-deployment/bin/stack-variables-to-client.sh",
-    "update-pdf-lambda-code": "bash ../deployment/custom-deployment/bin/update-pdf-lambda-code.sh",
+    "update-client-stack-variables": "chmod u+x ../deployment/custom-deployment/bin/* && ../deployment/custom-deployment/bin/stack-variables-to-client.sh",
+    "update-pdf-lambda-code": "chmod u+x ../deployment/custom-deployment/bin/* && ../deployment/custom-deployment/bin/update-pdf-lambda-code.sh",
     "dev": "next app",
     "build": "STACKNAME=$npm_package_stack_stackname AWS_REGION=$npm_package_stack_region yarn pre-build && next build app",
     "export": "yarn build && next export app",

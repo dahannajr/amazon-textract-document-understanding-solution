@@ -5,6 +5,7 @@ const ddb = require("@aws-cdk/aws-dynamodb");
 const es = require("@aws-cdk/aws-elasticsearch");
 const iam = require("@aws-cdk/aws-iam");
 const lambda = require("@aws-cdk/aws-lambda");
+const kms = require("@aws-cdk/aws-kms");
 const s3 = require("@aws-cdk/aws-s3");
 const sns = require("@aws-cdk/aws-sns");
 const snsSubscriptions = require("@aws-cdk/aws-sns-subscriptions");
@@ -15,6 +16,8 @@ const aws_cognito_1 = require("@aws-cdk/aws-cognito");
 const aws_cloudfront_1 = require("@aws-cdk/aws-cloudfront");
 const aws_iam_1 = require("@aws-cdk/aws-iam");
 const uuid = require("short-uuid");
+const aws_s3_1 = require("@aws-cdk/aws-s3");
+const aws_sqs_1 = require("@aws-cdk/aws-sqs");
 class CdkTextractStack extends cdk.Stack {
     /**
      *
@@ -43,17 +46,20 @@ class CdkTextractStack extends cdk.Stack {
         const documentsS3Bucket = new s3.Bucket(this, this.resourceName("DocumentsS3Bucket"), {
             bucketName: this.resourceName("document-s3-bucket"),
             versioned: false,
-            cors: [corsRule]
+            cors: [corsRule],
+            encryption: aws_s3_1.BucketEncryption.S3_MANAGED
         });
         const samplesS3Bucket = new s3.Bucket(this, this.resourceName("SamplesS3Bucket"), {
             bucketName: this.resourceName("sample-s3-bucket"),
             versioned: false,
-            cors: [corsRule]
+            cors: [corsRule],
+            encryption: aws_s3_1.BucketEncryption.S3_MANAGED
         });
         // ### Client ###
         const clientAppS3Bucket = new s3.Bucket(this, this.resourceName("ClientAppS3Bucket"), {
             websiteIndexDocument: "index.html",
-            cors: [corsRule]
+            cors: [corsRule],
+            encryption: aws_s3_1.BucketEncryption.S3_MANAGED
         });
         // eslint-disable-next-line no-unused-vars
         const oai = new aws_cloudfront_1.CfnCloudFrontOriginAccessIdentity(this, "cdk-textract-oai", {
@@ -100,21 +106,28 @@ class CdkTextractStack extends cdk.Stack {
         clientAppS3Bucket.addToResourcePolicy(cloudfrontPolicyStatement);
         samplesS3Bucket.addToResourcePolicy(cloudfrontSamplesBucketPolicyStatement);
         documentsS3Bucket.addToResourcePolicy(cloudfrontDocumentsBucketPolicyStatement);
+        const esEncryptionKey = new kms.Key(this, 'esEncryptionKey', {
+            enableKeyRotation: true
+        });
         // Elasticsearch
         const elasticSearch = new es.CfnDomain(this, this.resourceName("ElasticSearchCluster"), {
             elasticsearchVersion: "6.5",
             elasticsearchClusterConfig: {
-                instanceType: "t2.medium.elasticsearch"
+                instanceType: "m5.large.elasticsearch"
             },
             ebsOptions: {
                 ebsEnabled: true,
                 volumeSize: 20,
                 volumeType: "gp2"
+            },
+            encryptionAtRestOptions: {
+                enabled: true,
+                kmsKeyId: esEncryptionKey.keyId
             }
         });
         // SNS Topic
         const jobCompletionTopic = new sns.Topic(this, this.resourceName("JobCompletion"), {
-            displayName: "Job completion topic"
+            displayName: "Job completion topic",
         });
         // Textract service IAM role
         const textractServiceRole = new iam.Role(this, this.resourceName("TextractServiceRole"), {
@@ -128,24 +141,29 @@ class CdkTextractStack extends cdk.Stack {
         // DynamoDB tables
         const outputTable = new ddb.Table(this, this.resourceName("OutputTable"), {
             partitionKey: { name: "documentId", type: ddb.AttributeType.STRING },
-            sortKey: { name: "outputType", type: ddb.AttributeType.STRING }
+            sortKey: { name: "outputType", type: ddb.AttributeType.STRING },
+            serverSideEncryption: true,
         });
         const documentsTable = new ddb.Table(this, this.resourceName("DocumentsTable"), {
             partitionKey: { name: "documentId", type: ddb.AttributeType.STRING },
-            stream: ddb.StreamViewType.NEW_IMAGE
+            stream: ddb.StreamViewType.NEW_IMAGE,
+            serverSideEncryption: true,
         });
         // SQS queues
         const syncJobsQueue = new sqs.Queue(this, this.resourceName("SyncJobs"), {
-            visibilityTimeout: cdk.Duration.seconds(30),
-            retentionPeriod: cdk.Duration.seconds(1209600)
+            visibilityTimeout: cdk.Duration.seconds(900),
+            retentionPeriod: cdk.Duration.seconds(1209600),
+            encryption: aws_sqs_1.QueueEncryption.KMS_MANAGED
         });
         const asyncJobsQueue = new sqs.Queue(this, this.resourceName("AsyncJobs"), {
-            visibilityTimeout: cdk.Duration.seconds(30),
-            retentionPeriod: cdk.Duration.seconds(1209600)
+            visibilityTimeout: cdk.Duration.seconds(120),
+            retentionPeriod: cdk.Duration.seconds(1209600),
+            encryption: aws_sqs_1.QueueEncryption.KMS_MANAGED
         });
         const jobErrorHandlerQueue = new sqs.Queue(this, this.resourceName("jobErrorHandler"), {
-            visibilityTimeout: cdk.Duration.seconds(30),
-            retentionPeriod: cdk.Duration.seconds(1209600)
+            visibilityTimeout: cdk.Duration.seconds(60),
+            retentionPeriod: cdk.Duration.seconds(1209600),
+            encryption: aws_sqs_1.QueueEncryption.KMS_MANAGED
         });
         const jobResultsQueue = new sqs.Queue(this, this.resourceName("JobResults"), {
             visibilityTimeout: cdk.Duration.seconds(900),
@@ -290,6 +308,7 @@ class CdkTextractStack extends cdk.Stack {
             runtime: lambda.Runtime.PYTHON_3_7,
             code: lambda.Code.fromAsset("lambda/documentprocessor"),
             handler: "lambda_function.lambda_handler",
+            reservedConcurrentExecutions: 50,
             timeout: cdk.Duration.seconds(300),
             environment: {
                 SYNC_QUEUE_URL: syncJobsQueue.queueUrl,
@@ -312,8 +331,9 @@ class CdkTextractStack extends cdk.Stack {
         const jobErrorHandler = new lambda.Function(this, this.resourceName("JobErrorHandlerLambda"), {
             runtime: lambda.Runtime.PYTHON_3_7,
             code: lambda.Code.fromAsset("lambda/joberrorhandler"),
+            reservedConcurrentExecutions: 50,
             handler: "lambda_function.lambda_handler",
-            timeout: cdk.Duration.seconds(30),
+            timeout: cdk.Duration.seconds(60),
             environment: {
                 DOCUMENTS_TABLE: documentsTable.tableName
             }
@@ -330,6 +350,7 @@ class CdkTextractStack extends cdk.Stack {
         const pdfGenerator = new lambda.Function(this, this.resourceName("PdfGenerator"), {
             runtime: lambda.Runtime.JAVA_8,
             code: props.isCICDDeploy ? cicdPDFLoc : yarnPDFLoc,
+            reservedConcurrentExecutions: 50,
             handler: "DemoLambdaV2::handleRequest",
             memorySize: 3000,
             timeout: cdk.Duration.seconds(900)
@@ -342,8 +363,8 @@ class CdkTextractStack extends cdk.Stack {
             runtime: lambda.Runtime.PYTHON_3_7,
             code: lambda.Code.asset("lambda/syncprocessor"),
             handler: "lambda_function.lambda_handler",
-            reservedConcurrentExecutions: 1,
-            timeout: cdk.Duration.seconds(25),
+            reservedConcurrentExecutions: 25,
+            timeout: cdk.Duration.seconds(900),
             environment: {
                 OUTPUT_BUCKET: documentsS3Bucket.bucketName,
                 OUTPUT_TABLE: outputTable.tableName,
@@ -366,20 +387,21 @@ class CdkTextractStack extends cdk.Stack {
         samplesS3Bucket.grantReadWrite(syncProcessor);
         outputTable.grantReadWriteData(syncProcessor);
         documentsTable.grantReadWriteData(syncProcessor);
+        esEncryptionKey.grantEncryptDecrypt(syncProcessor);
         syncProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["textract:*"],
+            actions: ["textract:DetectDocumentText", "textract:AnalyzeDocument"],
             resources: ["*"]
         }));
         syncProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["comprehend:*"],
+            actions: ["comprehend:BatchDetectEntities", "comprehend:DetectEntities"],
             resources: ["*"]
         }));
         syncProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["comprehendmedical:*"],
+            actions: ["comprehendmedical:InferICD10CM", "comprehendmedical:DetectEntitiesV2"],
             resources: ["*"]
         }));
         syncProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["es:*"],
+            actions: ['es:ESHttpHead', 'es:Get*', 'es:List*', 'es:Describe*', 'es:ESHttpGet', 'es:ESHttpDelete', 'es:ESHttpPost', 'es:ESHttpPut'],
             resources: [`${elasticSearch.attrArn}/*`]
         }));
         //------------------------------------------------------------
@@ -388,8 +410,8 @@ class CdkTextractStack extends cdk.Stack {
             runtime: lambda.Runtime.PYTHON_3_7,
             code: lambda.Code.asset("lambda/asyncprocessor"),
             handler: "lambda_function.lambda_handler",
-            reservedConcurrentExecutions: 1,
-            timeout: cdk.Duration.seconds(15),
+            reservedConcurrentExecutions: 25,
+            timeout: cdk.Duration.seconds(120),
             environment: {
                 ASYNC_QUEUE_URL: asyncJobsQueue.queueUrl,
                 SNS_TOPIC_ARN: jobCompletionTopic.topicArn,
@@ -399,14 +421,6 @@ class CdkTextractStack extends cdk.Stack {
         //Layer
         asyncProcessor.addLayers(helperLayer);
         asyncProcessor.addLayers(boto3Layer);
-        //Triggers
-        // Run async job processor every minute
-        //const rule = new events.EventRule(this, resourceName('Rule'), {
-        //  scheduleExpression: 'rate(1 minute)',
-        //})
-        //rule.addTarget(asyncProcessor)
-        // Run when a job is successfully complete
-        //asyncProcessor.addEventSource(new SnsEventSource(jobCompletionTopic))
         asyncProcessor.addEventSource(new aws_lambda_event_sources_1.SqsEventSource(asyncJobsQueue, {
             batchSize: 1
         }));
@@ -419,7 +433,7 @@ class CdkTextractStack extends cdk.Stack {
             resources: [textractServiceRole.roleArn]
         }));
         asyncProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["textract:*"],
+            actions: ["textract:StartDocumentTextDetection", "textract:StartDocumentAnalysis"],
             resources: ["*"]
         }));
         //------------------------------------------------------------
@@ -429,7 +443,7 @@ class CdkTextractStack extends cdk.Stack {
             code: lambda.Code.asset("lambda/jobresultprocessor"),
             handler: "lambda_function.lambda_handler",
             memorySize: 2000,
-            reservedConcurrentExecutions: 50,
+            reservedConcurrentExecutions: 25,
             timeout: cdk.Duration.seconds(900),
             environment: {
                 OUTPUT_BUCKET: documentsS3Bucket.bucketName,
@@ -454,21 +468,22 @@ class CdkTextractStack extends cdk.Stack {
         documentsS3Bucket.grantReadWrite(jobResultProcessor);
         samplesS3Bucket.grantReadWrite(jobResultProcessor);
         jobResultProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["textract:*"],
+            actions: ["textract:GetDocumentTextDetection", "textract:GetDocumentAnalysis"],
             resources: ["*"]
         }));
         jobResultProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["es:*"],
+            actions: ['es:ESHttpHead', 'es:Get*', 'es:List*', 'es:Describe*', 'es:ESHttpGet', 'es:ESHttpDelete', 'es:ESHttpPost', 'es:ESHttpPut'],
             resources: [`${elasticSearch.attrArn}/*`]
         }));
         jobResultProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["comprehend:*"],
+            actions: ["comprehend:BatchDetectEntities", "comprehend:DetectEntities"],
             resources: ["*"]
         }));
         jobResultProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["comprehendmedical:*"],
+            actions: ["comprehendmedical:InferICD10CM", "comprehendmedical:DetectEntitiesV2"],
             resources: ["*"]
         }));
+        esEncryptionKey.grantEncryptDecrypt(jobResultProcessor);
         //------------------------------------------------------------
         pdfGenerator.grantInvoke(syncProcessor);
         pdfGenerator.grantInvoke(jobResultProcessor);
@@ -478,7 +493,7 @@ class CdkTextractStack extends cdk.Stack {
             runtime: lambda.Runtime.PYTHON_3_7,
             code: lambda.Code.asset("lambda/apiprocessor"),
             handler: "lambda_function.lambda_handler",
-            reservedConcurrentExecutions: 50,
+            reservedConcurrentExecutions: 100,
             timeout: cdk.Duration.seconds(60),
             environment: {
                 CONTENT_BUCKET: documentsS3Bucket.bucketName,
@@ -498,14 +513,11 @@ class CdkTextractStack extends cdk.Stack {
         documentsS3Bucket.grantRead(apiProcessor);
         samplesS3Bucket.grantRead(apiProcessor);
         apiProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["es:*"],
+            actions: ['es:ESHttpHead', 'es:Get*', 'es:List*', 'es:Describe*', 'es:ESHttpGet', 'es:ESHttpDelete', 'es:ESHttpPost', 'es:ESHttpPut'],
             resources: [`${elasticSearch.attrArn}/*`]
         }));
-        apiProcessor.addToRolePolicy(new iam.PolicyStatement({
-            actions: ["comprehend:*"],
-            resources: ["*"]
-        }));
-        const api = new apigateway.LambdaRestApi(this, this.resourceName("TextractAPI"), {
+        esEncryptionKey.grantEncryptDecrypt(apiProcessor);
+        const api = new apigateway.LambdaRestApi(this, this.resourceName("DUSAPI"), {
             handler: apiProcessor,
             proxy: false
         });
